@@ -1,0 +1,11 @@
+[package]
+name = "ps2net"
+description = "Network access to PS2 memory cards: PS2SM homebrew protocol and MemCard PRO2 FTP"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ps2mc.workspace = true
+thiserror.workspace = true
+suppaftp = { version = "8", default-features = false }

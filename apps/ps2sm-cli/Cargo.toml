@@ -1,0 +1,16 @@
+[package]
+name = "ps2sm-cli"
+description = "Command line PS2 save manager"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "ps2sm"
+path = "src/main.rs"
+
+[dependencies]
+ps2mc.workspace = true
+ps2net.workspace = true
+anyhow.workspace = true
+clap = { version = "4", features = ["derive"] }

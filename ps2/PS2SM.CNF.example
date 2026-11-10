@@ -1,0 +1,21 @@
+# PS2 Save Manager settings.
+# Copy to PS2SM.CNF next to PS2SM.ELF, or to mc0:/PS2SM/PS2SM.CNF,
+# or mass:/PS2SM/PS2SM.CNF. Lines starting with # are ignored.
+
+# Network: "dhcp" or a static address.
+ip=dhcp
+#ip=192.168.1.50
+#netmask=255.255.255.0
+#gateway=192.168.1.1
+
+# TCP port for the desktop app.
+port=6524
+
+# SMB share for backups (SMB1 / NT LM 0.12, like OPL).
+# Backups go to \\smb_ip\smb_share\smb_dir\<SAVE>.psu
+#smb_ip=192.168.1.10
+#smb_port=445
+#smb_share=PS2
+#smb_user=GUEST
+#smb_pass=
+#smb_dir=PS2SM

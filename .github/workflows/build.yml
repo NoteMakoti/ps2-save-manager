@@ -1,0 +1,57 @@
+name: build
+
+on: [push, pull_request]
+
+jobs:
+  desktop:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libgl1-mesa-dev
+      - run: cargo test --workspace
+      - run: cargo build --release --workspace
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ps2sm-${{ matrix.os }}
+          path: |
+            target/release/ps2sm
+            target/release/ps2sm.exe
+            target/release/ps2sm-gui
+            target/release/ps2sm-gui.exe
+
+  ps2:
+    runs-on: ubuntu-latest
+    container: ps2dev/ps2dev:latest
+    steps:
+      - run: apk add --no-cache make git
+      - uses: actions/checkout@v4
+      - run: make -C ps2
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PS2SM.ELF
+          path: |
+            ps2/PS2SM.ELF
+            ps2/PS2SM.CNF.example
+
+  hosttest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: make -C ps2/hosttest
+      - run: cargo build -p ps2sm-cli
+      - name: PS2 server code against the desktop client
+        run: |
+          mkdir -p /tmp/t/slot1
+          CARD_ROOT=/tmp/t ps2/hosttest/ps2sm-host 6524 &
+          sleep 1
+          cargo run -q -p ps2mc --example interop mksave /tmp/s.psu psu
+          ./target/debug/ps2sm ps2 127.0.0.1 put /tmp/s.psu
+          ./target/debug/ps2sm ps2 127.0.0.1 saves
+          ./target/debug/ps2sm ps2 127.0.0.1 dump /tmp/d.ps2
+          ./target/debug/ps2sm check /tmp/d.ps2

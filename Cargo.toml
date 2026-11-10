@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = ["crates/ps2mc", "crates/ps2net", "apps/ps2sm-cli", "apps/ps2sm-gui"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["Stan McCatty"]
+
+[workspace.dependencies]
+ps2mc = { path = "crates/ps2mc" }
+ps2net = { path = "crates/ps2net" }
+thiserror = "1"
+anyhow = "1"
+
+[profile.release]
+lto = "thin"

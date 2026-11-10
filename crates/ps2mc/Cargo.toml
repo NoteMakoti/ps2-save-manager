@@ -1,0 +1,12 @@
+[package]
+name = "ps2mc"
+description = "PlayStation 2 memory card image and save file library"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+encoding_rs = "0.8"
+crc32fast = "1"
+flate2 = "1"

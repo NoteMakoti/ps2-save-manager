@@ -1,0 +1,18 @@
+[package]
+name = "ps2sm-gui"
+description = "Desktop PS2 save manager"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "ps2sm-gui"
+path = "src/main.rs"
+
+[dependencies]
+ps2mc.workspace = true
+ps2net.workspace = true
+anyhow.workspace = true
+eframe = { version = "0.33", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+egui_extras = { version = "0.33" }
+rfd = "0.15"
