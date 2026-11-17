@@ -111,15 +111,45 @@ int net_init(void (*progress)(const char *msg))
 
 /* ------------------------------------------------------------------ */
 
+/*
+ * Socket I/O goes through a 64-byte aligned bounce buffer in pieces of at
+ * most NET_CHUNK bytes. ps2ips.irx moves at most 1024 bytes per RPC through
+ * a 1056-byte IOP buffer at offset 64, so a full 1024-byte transfer runs
+ * past its end; staying at 960 bytes keeps every transfer inside it.
+ */
+#define NET_CHUNK 960
+#define NET_IO_TIMEOUT_MS 15000 /* give up on a client that stops mid-message */
+
+static u8 net_buf[NET_CHUNK] __attribute__((aligned(64)));
+
+/* Wait until fd is readable (want_write=0) or writable. 1 = ready. */
+static int wait_fd(int fd, int want_write, int timeout_ms)
+{
+    fd_set fs;
+    FD_ZERO(&fs);
+    FD_SET(fd, &fs);
+    struct timeval tv = {timeout_ms / 1000, (timeout_ms % 1000) * 1000};
+    int r = want_write ? select(fd + 1, NULL, &fs, NULL, &tv) : select(fd + 1, &fs, NULL, NULL, &tv);
+    return r > 0 && FD_ISSET(fd, &fs);
+}
+
 static int send_all(int fd, const void *p, int n)
 {
     const u8 *b = p;
     while (n > 0) {
-        int r = send(fd, b, n > 65536 ? 65536 : n, 0);
-        if (r <= 0)
-            return -1;
-        b += r;
-        n -= r;
+        int c = n > NET_CHUNK ? NET_CHUNK : n;
+        memcpy(net_buf, b, c);
+        int done = 0;
+        while (done < c) {
+            if (!wait_fd(fd, 1, NET_IO_TIMEOUT_MS))
+                return -1;
+            int r = send(fd, net_buf + done, c - done, 0);
+            if (r <= 0)
+                return -1;
+            done += r;
+        }
+        b += c;
+        n -= c;
     }
     return 0;
 }
@@ -128,9 +158,12 @@ static int recv_all(int fd, void *p, int n)
 {
     u8 *b = p;
     while (n > 0) {
-        int r = recv(fd, b, n > 65536 ? 65536 : n, 0);
+        if (!wait_fd(fd, 0, NET_IO_TIMEOUT_MS))
+            return -1;
+        int r = recv(fd, net_buf, n > NET_CHUNK ? NET_CHUNK : n, 0);
         if (r <= 0)
             return -1;
+        memcpy(b, net_buf, r);
         b += r;
         n -= r;
     }
@@ -222,30 +255,38 @@ static int reply_err(int fd, u8 cmd, s16 st, u32 id, const char *msg)
 
 static int st_from_mc(int r)
 {
-    if (r == -1000)
-        return ST_BAD_REQUEST;
-    if (r == -1001)
-        return ST_EXISTS;
     return mcio_status(r);
 }
 
-static int card_ready(int port, char *err)
+/* "<what>: <reason>" for a failed card operation */
+static void mc_err(char *err, int errlen, const char *what, int r)
+{
+    snprintf(err, errlen, "%s: %s (%d)", what, mcio_strerror(r), r);
+}
+
+/* Checks that a formatted PS2 card is present. Returns ST_OK or an error
+ * status with a message in err. */
+static int card_ready(int port, char *err, int errlen)
 {
     mc_info_t mi;
-    mcio_info(port, &mi);
+    int r = mcio_info(port, &mi);
+    if (r < 0) {
+        mc_err(err, errlen, "memory card", r);
+        return ST_IO;
+    }
     if (!mi.present) {
-        strcpy(err, "no memory card in this slot");
-        return 0;
+        snprintf(err, errlen, "no memory card in slot %d", port + 1);
+        return ST_NO_CARD;
     }
     if (mi.type != sceMcTypePS2) {
-        strcpy(err, "not a PS2 memory card");
-        return 0;
+        snprintf(err, errlen, "the card in slot %d is not a PS2 memory card", port + 1);
+        return ST_NO_CARD;
     }
     if (!mi.formatted) {
-        strcpy(err, "memory card is not formatted");
-        return 0;
+        snprintf(err, errlen, "the memory card in slot %d is not formatted", port + 1);
+        return ST_NO_CARD;
     }
-    return 1;
+    return ST_OK;
 }
 
 /* Handle one request. Returns <0 to drop the connection. */
@@ -255,7 +296,7 @@ static int handle(int fd, u8 cmd, u32 id, const u8 *payload, int len)
     buf_t out;
     buf_init(&out);
     int st = ST_OK;
-    char err[96] = "";
+    char err[160] = "";
     char path[160];
     int port = 0;
 
@@ -283,7 +324,8 @@ static int handle(int fd, u8 cmd, u32 id, const u8 *payload, int len)
     switch (cmd) {
         case CMD_CARD_INFO: {
             mc_info_t mi;
-            mcio_info(port, &mi);
+            int res = mcio_info(port, &mi);
+            if (res < 0) { st = ST_IO; mc_err(err, sizeof(err), "memory card", res); break; }
             buf_u8(&out, mi.present);
             buf_u8(&out, mi.type);
             buf_u8(&out, mi.formatted);
@@ -295,11 +337,11 @@ static int handle(int fd, u8 cmd, u32 id, const u8 *payload, int len)
         case CMD_LIST_DIR: {
             rd_str(&r, path, sizeof(path));
             if (r.bad) { st = ST_BAD_REQUEST; strcpy(err, "bad path"); break; }
-            if (!card_ready(port, err)) { st = ST_NO_CARD; break; }
+            if ((st = card_ready(port, err, sizeof(err))) != ST_OK) break;
             sceMcTblGetDir *e;
             int n;
             int res = mcio_list(port, path, &e, &n);
-            if (res < 0) { st = st_from_mc(res); strcpy(err, "list failed"); break; }
+            if (res < 0) { st = st_from_mc(res); mc_err(err, sizeof(err), "list failed", res); break; }
             buf_u32(&out, n);
             for (int i = 0; i < n; i++) {
                 buf_str(&out, (const char *)e[i].EntryName);
@@ -312,11 +354,11 @@ static int handle(int fd, u8 cmd, u32 id, const u8 *payload, int len)
             break;
         }
         case CMD_LIST_SAVES: {
-            if (!card_ready(port, err)) { st = ST_NO_CARD; break; }
+            if ((st = card_ready(port, err, sizeof(err))) != ST_OK) break;
             save_info_t *s;
             int n;
             int res = mcio_list_saves(port, &s, &n);
-            if (res < 0) { st = st_from_mc(res); strcpy(err, "list failed"); break; }
+            if (res < 0) { st = st_from_mc(res); mc_err(err, sizeof(err), "list failed", res); break; }
             buf_u32(&out, n);
             for (int i = 0; i < n; i++) {
                 buf_str(&out, s[i].name);
@@ -331,11 +373,11 @@ static int handle(int fd, u8 cmd, u32 id, const u8 *payload, int len)
         case CMD_READ_FILE: {
             rd_str(&r, path, sizeof(path));
             if (r.bad) { st = ST_BAD_REQUEST; strcpy(err, "bad path"); break; }
-            if (!card_ready(port, err)) { st = ST_NO_CARD; break; }
+            if ((st = card_ready(port, err, sizeof(err))) != ST_OK) break;
             u8 *d;
             int n;
             int res = mcio_read_file(port, path, &d, &n);
-            if (res < 0) { st = st_from_mc(res); strcpy(err, "read failed"); break; }
+            if (res < 0) { st = st_from_mc(res); mc_err(err, sizeof(err), "read failed", res); break; }
             buf_put(&out, d, n);
             free(d);
             break;
@@ -344,9 +386,9 @@ static int handle(int fd, u8 cmd, u32 id, const u8 *payload, int len)
             rd_str(&r, path, sizeof(path));
             u32 n = rd_u32(&r);
             if (r.bad || r.pos + (int)n != len) { st = ST_BAD_REQUEST; strcpy(err, "bad request"); break; }
-            if (!card_ready(port, err)) { st = ST_NO_CARD; break; }
+            if ((st = card_ready(port, err, sizeof(err))) != ST_OK) break;
             int res = mcio_write_file(port, path, payload + r.pos, n);
-            if (res < 0) { st = st_from_mc(res); strcpy(err, "write failed"); }
+            if (res < 0) { st = st_from_mc(res); mc_err(err, sizeof(err), "write failed", res); }
             break;
         }
         case CMD_MKDIR:
@@ -354,11 +396,11 @@ static int handle(int fd, u8 cmd, u32 id, const u8 *payload, int len)
         case CMD_DELETE_SAVE: {
             rd_str(&r, path, sizeof(path));
             if (r.bad || !path[0] || !strcmp(path, "/")) { st = ST_BAD_REQUEST; strcpy(err, "bad path"); break; }
-            if (!card_ready(port, err)) { st = ST_NO_CARD; break; }
+            if ((st = card_ready(port, err, sizeof(err))) != ST_OK) break;
             int res = cmd == CMD_MKDIR ? mcio_mkdir(port, path)
                     : cmd == CMD_DELETE ? mcio_delete(port, path)
                     : mcio_delete_tree(port, path);
-            if (res < 0) { st = st_from_mc(res); snprintf(err, sizeof(err), "failed (%d)", res); }
+            if (res < 0) { st = st_from_mc(res); mc_err(err, sizeof(err), path, res); }
             if (cmd == CMD_DELETE_SAVE && res >= 0)
                 snprintf(g_net_last, sizeof(g_net_last), "deleted %s", path);
             break;
@@ -366,28 +408,33 @@ static int handle(int fd, u8 cmd, u32 id, const u8 *payload, int len)
         case CMD_GET_SAVE: {
             rd_str(&r, path, sizeof(path));
             if (r.bad || strchr(path, '/')) { st = ST_BAD_REQUEST; strcpy(err, "bad name"); break; }
-            if (!card_ready(port, err)) { st = ST_NO_CARD; break; }
+            if ((st = card_ready(port, err, sizeof(err))) != ST_OK) break;
             int res = mcio_save_to_psu(port, path, &out);
-            if (res < 0) { st = st_from_mc(res); strcpy(err, res == sceMcResNoEntry ? "no such save" : "read failed"); }
+            if (res < 0) { st = st_from_mc(res); mc_err(err, sizeof(err), path, res); }
             else snprintf(g_net_last, sizeof(g_net_last), "sent %s", path);
             break;
         }
         case CMD_PUT_SAVE: {
             int overwrite = rd_u8(&r);
             if (r.bad) { st = ST_BAD_REQUEST; strcpy(err, "bad request"); break; }
-            if (!card_ready(port, err)) { st = ST_NO_CARD; break; }
+            if ((st = card_ready(port, err, sizeof(err))) != ST_OK) break;
             char name[40] = "";
             int res = mcio_psu_to_card(port, payload + r.pos, len - r.pos, overwrite, name);
             if (res < 0) {
                 st = st_from_mc(res);
-                snprintf(err, sizeof(err), st == ST_EXISTS ? "%s already exists" : st == ST_NO_SPACE ? "not enough space for %s" : "write of %s failed", name);
+                if (st == ST_EXISTS)
+                    snprintf(err, sizeof(err), "%s already exists", name);
+                else if (st == ST_NO_SPACE)
+                    snprintf(err, sizeof(err), "not enough space for %s", name);
+                else
+                    mc_err(err, sizeof(err), name[0] ? name : "save", res);
             } else
                 snprintf(g_net_last, sizeof(g_net_last), "received %s", name);
             break;
         }
         case CMD_FORMAT: {
             int res = mcio_format(port);
-            if (res < 0) { st = st_from_mc(res); strcpy(err, "format failed"); }
+            if (res < 0) { st = st_from_mc(res); mc_err(err, sizeof(err), "format failed", res); }
             break;
         }
         case CMD_MMCE_STATUS: {
@@ -434,6 +481,9 @@ int net_server_start(int port)
     listen_fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (listen_fd < 0)
         return -1;
+    /* allow restarting the server right after it was stopped */
+    int one = 1;
+    setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
     struct sockaddr_in a;
     memset(&a, 0, sizeof(a));
     a.sin_family = AF_INET;

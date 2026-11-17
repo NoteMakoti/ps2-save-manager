@@ -39,6 +39,17 @@ struct Source {
     error: Option<String>,
     busy: bool,
     mmce: String,
+    // Facts about the backend, kept here so drawing the UI never has to
+    // lock a backend that a worker thread may be holding for a long
+    // network operation (that is what used to freeze the whole window).
+    is_ps2: bool,
+    is_ps1: bool,
+    is_mcp: bool,
+    has_path: bool,
+    is_library: bool,
+    /// A listing is running / another one was requested meanwhile.
+    refreshing: bool,
+    refresh_queued: bool,
 }
 
 enum Msg {
@@ -232,6 +243,12 @@ impl App {
         let id = self.next_id;
         self.next_id += 1;
         let kind = backend.kind();
+        let (is_ps2, is_ps1, is_mcp, has_path, is_library) = match &backend {
+            Backend::Card { path, mcp, .. } => (false, false, mcp.is_some(), path.is_some(), false),
+            Backend::Ps1 { path, mcp, .. } => (false, true, mcp.is_some(), path.is_some(), false),
+            Backend::Ps2 { .. } => (true, false, false, false, false),
+            Backend::Library { .. } => (false, false, false, false, true),
+        };
         self.sources.push(Source {
             id,
             label,
@@ -243,6 +260,13 @@ impl App {
             error: None,
             busy: false,
             mmce: String::new(),
+            is_ps2,
+            is_ps1,
+            is_mcp,
+            has_path,
+            is_library,
+            refreshing: false,
+            refresh_queued: false,
         });
         // show it in an empty pane (otherwise pick it from a pane's list)
         if let Some(p) = self.panes.iter_mut().find(|p| p.source.is_none()) {
@@ -262,6 +286,12 @@ impl App {
 
     fn refresh(&mut self, id: u64) {
         let Some(src) = self.source_mut(id) else { return };
+        if src.refreshing {
+            // one listing at a time; run another when this one is done
+            src.refresh_queued = true;
+            return;
+        }
+        src.refreshing = true;
         src.busy = true;
         let be = src.backend.clone();
         let tx = self.tx.clone();
@@ -338,8 +368,11 @@ impl App {
                 Msg::Log(s) => self.log(s),
                 Msg::Error(s) => self.err(s),
                 Msg::Listed { id, result } => {
+                    let mut again = false;
                     if let Some(src) = self.source_mut(id) {
                         src.busy = false;
+                        src.refreshing = false;
+                        again = std::mem::take(&mut src.refresh_queued);
                         match result {
                             Ok((rows, status)) => {
                                 src.selected.retain(|k| rows.iter().any(|r| &r.key == k));
@@ -350,8 +383,12 @@ impl App {
                             Err(e) => {
                                 src.error = Some(e);
                                 src.rows.clear();
+                                src.selected.clear();
                             }
                         }
+                    }
+                    if again {
+                        self.refresh(id);
                     }
                 }
                 Msg::Refresh(ids) => {
@@ -386,6 +423,7 @@ impl App {
                 Msg::Relabel { id, label } => {
                     if let Some(s) = self.source_mut(id) {
                         s.label = label;
+                        s.has_path = true; // only sent after saving to a file
                     }
                 }
                 Msg::McpIdle => self.mcp_busy = false,
@@ -862,13 +900,7 @@ impl App {
             if s.status.dirty {
                 ui.horizontal(|ui| {
                     ui.add_space(22.0);
-                    let b = s.backend.lock().unwrap();
-                    let (has_path, is_mcp) = match &*b {
-                        Backend::Card { path, mcp, .. } => (path.is_some(), mcp.is_some()),
-                        Backend::Ps1 { path, mcp, .. } => (path.is_some(), mcp.is_some()),
-                        _ => (false, false),
-                    };
-                    drop(b);
+                    let (has_path, is_mcp) = (s.has_path, s.is_mcp);
                     if is_mcp {
                         if ui.small_button("Upload to PRO2").clicked() {
                             upload = Some(s.id);
@@ -946,7 +978,7 @@ impl App {
         if let Some(e) = &src.error {
             ui.colored_label(ui.visuals().error_fg_color, e);
         }
-        let is_ps2 = matches!(&*src.backend.lock().unwrap(), Backend::Ps2 { .. });
+        let is_ps2 = src.is_ps2;
         let mmce_text = src.mmce.clone();
         let n_sel = src.selected.len();
 
@@ -1144,7 +1176,7 @@ impl App {
 
     fn open_pro2_dialog(&mut self, id: u64) {
         let Some(src) = self.source(id) else { return };
-        let is_ps2_link = matches!(&*src.backend.lock().unwrap(), Backend::Ps2 { .. });
+        let is_ps2_link = src.is_ps2;
         // name: a single game's ID if the card only holds one game, else the label
         let ids: BTreeSet<String> = src.rows.iter().filter_map(|r| ps2mc::save::game_id_from_dir(&r.name)).collect();
         let folder = if ids.len() == 1 && src.rows.len() == ids.len() {
@@ -1173,7 +1205,7 @@ impl App {
             self.pro2 = None;
             return;
         };
-        let src_is_ps1 = matches!(&*src.backend.lock().unwrap(), Backend::Ps1 { .. });
+        let src_is_ps1 = src.is_ps1;
         let mut open = true;
         let mut go = false;
         egui::Window::new("Export to MemCard PRO2")
@@ -1628,11 +1660,17 @@ impl eframe::App for App {
                 if before != self.export_format {
                     self.settings.export_format = self.export_format.extension().into();
                     self.settings.save();
-                    for s in &self.sources {
-                        if let Backend::Library { format, .. } = &mut *s.backend.lock().unwrap() {
-                            *format = self.export_format;
+                    // update save folders in the background: one may be busy
+                    let fmt = self.export_format;
+                    let libs: Vec<Shared> =
+                        self.sources.iter().filter(|s| s.is_library).map(|s| s.backend.clone()).collect();
+                    std::thread::spawn(move || {
+                        for b in libs {
+                            if let Backend::Library { format, .. } = &mut *b.lock().unwrap() {
+                                *format = fmt;
+                            }
                         }
-                    }
+                    });
                 }
             });
         });

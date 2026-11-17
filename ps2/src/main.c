@@ -49,12 +49,17 @@ IRX(ps2ip_nm)
 IRX(ps2ips)
 IRX(smbman)
 
+/* Names of IOP modules that failed to load, shown in About. */
+static char g_failed_modules[160] = "";
+
 static int load(const char *name, unsigned char *irx, unsigned int size, int argc_len, const char *args)
 {
     int ret = 0;
     int id = SifExecModuleBuffer(irx, size, argc_len, args, &ret);
     if (id < 0 || ret == 1 /* NO_RESIDENT_END */) {
         printf("PS2SM: %s failed (%d/%d)\n", name, id, ret);
+        size_t l = strlen(g_failed_modules);
+        snprintf(g_failed_modules + l, sizeof(g_failed_modules) - l, "%s%s", l ? ", " : "", name);
         return -1;
     }
     return 0;
@@ -87,10 +92,14 @@ static void init_all(void)
     LOAD(iomanX);
     LOAD(fileXio);
     fileXioInit();
-    LOAD(sio2man);
-    LOAD(mcman);
-    LOAD(mcserv);
-    mcio_init();
+    int mc_ok = LOAD(sio2man) == 0;
+    mc_ok = LOAD(mcman) == 0 && mc_ok;
+    mc_ok = LOAD(mcserv) == 0 && mc_ok;
+    /* Without mcserv, mcInit() would wait for it forever. */
+    if (mc_ok && mcio_init() < 0)
+        mc_ok = 0;
+    if (!mc_ok)
+        ui_status("Memory card driver failed to load - card functions are disabled.");
     LOAD(padman);
     ui_pad_init();
 
@@ -155,7 +164,7 @@ static int backup_save(int port, const char *dir, target_t t)
         char name[48];
         snprintf(name, sizeof(name), "%s.psu", dir);
         ui_status("Writing %s to %s...", name, storage_name(t));
-        r = storage_write(t, name, b.data, b.len);
+        r = storage_write(t, name, b.data, b.len) < 0 ? MCIO_E_STORAGE : 0;
     }
     buf_free(&b);
     return r;
@@ -170,7 +179,7 @@ static int copy_save(int from, const char *dir, int to)
     if (r == 0) {
         ui_status("Writing to slot %d...", to + 1);
         r = mcio_psu_to_card(to, b.data, b.len, 0, NULL);
-        if (r == -1001 && ui_confirm("%s exists in slot %d. Overwrite?", dir, to + 1))
+        if (r == MCIO_E_EXISTS && ui_confirm("%s exists in slot %d. Overwrite?", dir, to + 1))
             r = mcio_psu_to_card(to, b.data, b.len, 1, NULL);
     }
     buf_free(&b);
@@ -190,7 +199,13 @@ static void card_browser(int port)
     int cursor = 0;
     for (;;) {
         mc_info_t mi;
-        mcio_info(port, &mi);
+        ui_header("reading card");
+        ui_status("Checking slot %d...", port + 1);
+        int e = mcio_info(port, &mi);
+        if (e < 0) {
+            ui_message("Memory card", "Slot %d: %s (%d).", port + 1, mcio_strerror(e), e);
+            return;
+        }
         if (!mi.present) {
             ui_message("Memory card", "No memory card in slot %d.", port + 1);
             return;
@@ -202,7 +217,11 @@ static void card_browser(int port)
         if (!mi.formatted) {
             if (ui_confirm("Card in slot %d is unformatted. Format it now?", port + 1)) {
                 ui_status("Formatting...");
-                mcio_format(port);
+                e = mcio_format(port);
+                if (e < 0) {
+                    ui_message("Format", "Format failed: %s (%d).", mcio_strerror(e), e);
+                    return;
+                }
                 continue;
             }
             return;
@@ -210,7 +229,11 @@ static void card_browser(int port)
         saves_ctx_t ctx = {0, 0};
         ui_header("reading card");
         ui_status("Reading saves...");
-        mcio_list_saves(port, &ctx.saves, &ctx.count);
+        e = mcio_list_saves(port, &ctx.saves, &ctx.count);
+        if (e < 0) {
+            ui_message("Memory card", "Cannot read slot %d: %s (%d).", port + 1, mcio_strerror(e), e);
+            return;
+        }
         char title[64];
         snprintf(title, sizeof(title), "Slot %d - %d saves - %d KB free", port + 1, ctx.count, mi.free_kb);
         u32 pressed = 0;
@@ -254,13 +277,18 @@ static void card_browser(int port)
                     break;
                 }
                 r = backup_save(port, si.name, t);
-                ui_message("Backup", r == 0 ? "Saved %s.psu to %s." : "Backup of %s to %s failed.", si.name, storage_name(t));
+                if (r == 0)
+                    ui_message("Backup", "Saved %s.psu to %s.", si.name, storage_name(t));
+                else
+                    ui_message("Backup", "Backup of %s to %s failed: %s (%d).", si.name, storage_name(t), mcio_strerror(r), r);
                 break;
             }
             case 2:
                 r = copy_save(port, si.name, 1 - port);
-                if (r != -1001)
-                    ui_message("Copy", r == 0 ? "Copied %s to slot %d." : "Copy of %s to slot %d failed.", si.name, 2 - port);
+                if (r == 0)
+                    ui_message("Copy", "Copied %s to slot %d.", si.name, 2 - port);
+                else if (r != MCIO_E_EXISTS)
+                    ui_message("Copy", "Copy of %s to slot %d failed: %s (%d).", si.name, 2 - port, mcio_strerror(r), r);
                 break;
             case 3:
                 if (ui_confirm("Delete %s? This cannot be undone.", si.name)) {
@@ -268,7 +296,7 @@ static void card_browser(int port)
                     snprintf(p, sizeof(p), "/%s", si.name);
                     r = mcio_delete_tree(port, p);
                     if (r < 0)
-                        ui_message("Delete", "Delete failed (%d).", r);
+                        ui_message("Delete", "Delete failed: %s (%d).", mcio_strerror(r), r);
                 }
                 break;
             case 4: {
@@ -347,17 +375,17 @@ static void restore_browser(target_t t)
         char dir[40] = "";
         ui_status("Writing to slot %d...", port + 1);
         int r = mcio_psu_to_card(port, data, len, 0, dir);
-        if (r == -1001 && ui_confirm("%s already exists in slot %d. Overwrite?", dir, port + 1))
+        if (r == MCIO_E_EXISTS && ui_confirm("%s already exists in slot %d. Overwrite?", dir, port + 1))
             r = mcio_psu_to_card(port, data, len, 1, dir);
         free(data);
         if (r == 0)
             ui_message("Restore", "Restored %s to slot %d.", dir, port + 1);
         else if (r == sceMcResFullDevice)
             ui_message("Restore", "Not enough free space in slot %d.", port + 1);
-        else if (r == -1000)
+        else if (r == MCIO_E_BAD_PSU)
             ui_message("Restore", "%s is not a valid .psu file.", file);
-        else if (r != -1001)
-            ui_message("Restore", "Restore failed (%d).", r);
+        else if (r != MCIO_E_EXISTS)
+            ui_message("Restore", "Restore failed: %s (%d).", mcio_strerror(r), r);
     }
 }
 
@@ -491,10 +519,12 @@ int main(int argc, char *argv[])
             case 6:
                 ui_message("About",
                            "PS2 Save Manager %s\n\nIP: %s (%s)  port %d\nSMB: %s %s\nBackups: mass:/%s and smb:/%s\n\n"
-                           "Settings are read from PS2SM.CNF next to the ELF,\nmc0:/PS2SM/PS2SM.CNF or mass:/PS2SM/PS2SM.CNF.",
+                           "Settings are read from PS2SM.CNF next to the ELF,\nmc0:/PS2SM/PS2SM.CNF or mass:/PS2SM/PS2SM.CNF.\n\n"
+                           "Memory card driver: %s\nModules that failed to load: %s",
                            PS2SM_VERSION, g_ip_str, g_cfg.use_dhcp ? "DHCP" : "static", g_cfg.port,
                            g_cfg.smb_ip[0] ? g_cfg.smb_ip : "(not set)", g_cfg.smb_share, PS2SM_DIR,
-                           g_cfg.smb_dir);
+                           g_cfg.smb_dir, mcio_ready() ? "OK" : "not responding",
+                           g_failed_modules[0] ? g_failed_modules : "none");
                 break;
             case 7:
                 if (ui_confirm("Exit to the PS2 browser?")) {

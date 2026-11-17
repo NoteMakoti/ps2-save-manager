@@ -22,7 +22,11 @@ pub enum NetError {
     Io(#[from] std::io::Error),
     #[error("protocol error: {0}")]
     Protocol(String),
-    #[error("PS2 reported error {code}: {message}")]
+    #[error("the PS2 did not answer within {secs} s while {what}. Check that PS2SM is still showing the Network server screen; if it is, the memory card may be stuck - restart PS2SM")]
+    Timeout { what: &'static str, secs: u64 },
+    #[error("{0}")]
+    Disconnected(String),
+    #[error("PS2: {message}")]
     Remote { code: i16, message: String },
     #[error("{0}")]
     Refused(String),

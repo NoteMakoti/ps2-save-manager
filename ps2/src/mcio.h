@@ -6,6 +6,15 @@
 
 #define MCIO_MAX_ENTRIES 256
 
+/* Errors of our own (libmc results are > -100). */
+#define MCIO_E_TIMEOUT -2000   /* command did not finish in time */
+#define MCIO_E_BUSY -2001      /* an earlier command is still running */
+#define MCIO_E_NOT_READY -2002 /* libmc not initialised / nothing queued */
+#define MCIO_E_BAD_PSU -2003
+#define MCIO_E_EXISTS -2004
+#define MCIO_E_STORAGE -2005  /* USB/SMB backup file could not be written */
+#define MCIO_IS_DRIVER_ERROR(r) ((r) == MCIO_E_TIMEOUT || (r) == MCIO_E_BUSY || (r) == MCIO_E_NOT_READY)
+
 typedef struct
 {
     int present;   /* 1 if a card is inserted */
@@ -27,6 +36,10 @@ typedef struct
 } save_info_t;
 
 int mcio_init(void);
+/* 1 if libmc initialised and no command is stuck */
+int mcio_ready(void);
+const char *mcio_strerror(int r);
+int mcio_set_info(int port, const char *path, const sceMcTblGetDir *info);
 int mcio_info(int port, mc_info_t *info);
 
 /* Directory listing; path like "/" or "/BESLES-12345". Excludes . and .. */

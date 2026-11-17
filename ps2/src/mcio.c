@@ -1,25 +1,113 @@
 /*
  * Memory card access through libmc (mcman/mcserv on the IOP).
+ *
+ * Every libmc call is asynchronous: it queues one command on the IOP and
+ * mcSync() collects the result. We never use mcSync(MC_WAIT) - if the
+ * IOP side stops answering (driver problem, card pulled mid-transfer,
+ * SIO2 conflict) that spins forever and freezes the whole app, network
+ * server included. Instead mc_wait() polls with a time limit and turns a
+ * stuck command into an error the UI and the desktop app can show.
  */
 #include <stdlib.h>
+#include <malloc.h>
 #include <string.h>
 #include <stdio.h>
 #include <libmc.h>
+#include <delaythread.h>
 
 #include "mcio.h"
 
 #define CHUNK 8192
+#define MC_TIMEOUT_MS 8000         /* one read/write/dir command */
+#define MC_FORMAT_TIMEOUT_MS 60000 /* formatting a whole card */
 
-static int sync_ret(void)
+static int g_mc_init_result = -1;
+static int g_mc_stuck = 0;
+
+/* Results for mcGetInfo are written by libmc when the command finishes,
+ * possibly after we gave up waiting - so they must not live on the stack. */
+static int s_type, s_free, s_format;
+
+/* True when no libmc command is outstanding. Collects the result of a
+ * command that finished after we stopped waiting for it. */
+static int mc_idle(void)
 {
-    int ret;
-    mcSync(0, NULL, &ret);
-    return ret;
+    int cmd, r;
+    int st = mcSync(MC_NOWAIT, &cmd, &r);
+    if (st == 0)
+        return 0; /* still running */
+    if (g_mc_stuck)
+        g_mc_stuck = 0; /* the late command has finished after all */
+    return 1;
+}
+
+/* Wait for the command a libmc call just queued. `posted` is that call's
+ * return value (0 = queued). Returns the command's result, or MCIO_E_*. */
+static int mc_wait_ms(int posted, int timeout_ms)
+{
+    if (posted != 0)
+        return g_mc_init_result < 0 ? MCIO_E_NOT_READY : MCIO_E_BUSY;
+    int ret = MCIO_E_NOT_READY;
+    for (int waited = 0;; waited++) {
+        int cmd;
+        int st = mcSync(MC_NOWAIT, &cmd, &ret);
+        if (st == 1)
+            return ret;
+        if (st < 0)
+            return MCIO_E_NOT_READY; /* nothing was queued */
+        if (waited >= timeout_ms) {
+            g_mc_stuck = 1;
+            return MCIO_E_TIMEOUT;
+        }
+        DelayThread(1000);
+    }
+}
+
+static int mc_wait(int posted)
+{
+    return mc_wait_ms(posted, MC_TIMEOUT_MS);
+}
+
+/* Make sure libmc can take a new command. */
+static int mc_begin(void)
+{
+    if (g_mc_init_result < 0)
+        return MCIO_E_NOT_READY;
+    if (!mc_idle())
+        return MCIO_E_BUSY;
+    return 0;
 }
 
 int mcio_init(void)
 {
-    return mcInit(MC_TYPE_XMC);
+    g_mc_init_result = mcInit(MC_TYPE_XMC);
+    return g_mc_init_result;
+}
+
+int mcio_ready(void)
+{
+    return g_mc_init_result >= 0 && !g_mc_stuck;
+}
+
+const char *mcio_strerror(int r)
+{
+    switch (r) {
+        case MCIO_E_TIMEOUT: return "the memory card did not respond in time";
+        case MCIO_E_BUSY: return "the memory card driver is still busy with an earlier command";
+        case MCIO_E_NOT_READY: return "the memory card driver is not loaded";
+        case MCIO_E_BAD_PSU: return "not a valid .psu save";
+        case MCIO_E_EXISTS: return "the save already exists";
+        case MCIO_E_STORAGE: return "could not write the backup file";
+        case sceMcResNoEntry: return "no such file or folder";
+        case sceMcResFullDevice: return "the memory card is full";
+        case sceMcResNoFormat: return "the memory card is not formatted";
+        case sceMcResDeniedPermit: return "access denied (protected file?)";
+        case sceMcResNotEmpty: return "folder is not empty";
+        case sceMcResUpLimitHandle: return "too many open files";
+        case sceMcResFailDetect:
+        case sceMcResFailDetect2: return "no memory card detected";
+        default: return r < 0 ? "memory card error" : "ok";
+    }
 }
 
 int mcio_status(int r)
@@ -28,8 +116,12 @@ int mcio_status(int r)
         case sceMcResSucceed: return ST_OK;
         case sceMcResNoEntry: return ST_NOT_FOUND;
         case sceMcResFullDevice: return ST_NO_SPACE;
-        case sceMcResNoFormat: return ST_NO_CARD;
-        case sceMcResNotEmpty: return ST_BAD_REQUEST;
+        case sceMcResNoFormat:
+        case sceMcResFailDetect:
+        case sceMcResFailDetect2: return ST_NO_CARD;
+        case sceMcResNotEmpty:
+        case MCIO_E_BAD_PSU: return ST_BAD_REQUEST;
+        case MCIO_E_EXISTS: return ST_EXISTS;
         case sceMcResDeniedPermit: return ST_FAIL;
         default: return r < 0 ? ST_IO : ST_OK;
     }
@@ -37,21 +129,26 @@ int mcio_status(int r)
 
 int mcio_info(int port, mc_info_t *info)
 {
-    int type = 0, freec = 0, format = 0, ret;
     memset(info, 0, sizeof(*info));
+    int ret = MCIO_E_NOT_READY;
     /* The first call after a card change reports -1/-2; ask twice. */
     for (int tries = 0; tries < 2; tries++) {
-        mcGetInfo(port, 0, &type, &freec, &format);
-        ret = sync_ret();
+        int e = mc_begin();
+        if (e)
+            return e;
+        s_type = s_free = s_format = 0;
+        ret = mc_wait(mcGetInfo(port, 0, &s_type, &s_free, &s_format));
+        if (MCIO_IS_DRIVER_ERROR(ret))
+            return ret; /* driver problem, not a card state */
         if (ret == 0 || ret == -1 || ret == -2)
             break;
     }
-    if (ret < -2 || type == sceMcTypeNoCard)
-        return 0;
+    if ((ret != 0 && ret != -1 && ret != -2) || s_type == sceMcTypeNoCard)
+        return 0; /* no card */
     info->present = 1;
-    info->type = type;
-    info->formatted = (ret == -2) ? 0 : (format != 0);
-    info->free_kb = freec;
+    info->type = s_type;
+    info->formatted = (ret == -2) ? 0 : (s_format != 0);
+    info->free_kb = s_free;
     return 0;
 }
 
@@ -59,18 +156,27 @@ int mcio_list(int port, const char *path, sceMcTblGetDir **out, int *count)
 {
     static sceMcTblGetDir table[MCIO_MAX_ENTRIES] __attribute__((aligned(64)));
     char pattern[160];
+    *out = NULL;
+    *count = 0;
     if (!strcmp(path, "/") || !path[0])
         strcpy(pattern, "/*");
     else
         snprintf(pattern, sizeof(pattern), "%s%s/*", path[0] == '/' ? "" : "/", path);
 
-    mcGetDir(port, 0, pattern, 0, MCIO_MAX_ENTRIES, table);
-    int n = sync_ret();
+    int e = mc_begin();
+    if (e)
+        return e;
+    int n = mc_wait(mcGetDir(port, 0, pattern, 0, MCIO_MAX_ENTRIES, table));
     if (n < 0)
         return n;
+    if (n > MCIO_MAX_ENTRIES)
+        n = MCIO_MAX_ENTRIES;
     sceMcTblGetDir *res = malloc(sizeof(sceMcTblGetDir) * (n ? n : 1));
+    if (!res)
+        return sceMcResFullDevice;
     int k = 0;
     for (int i = 0; i < n; i++) {
+        table[i].EntryName[31] = 0;
         const char *nm = (const char *)table[i].EntryName;
         if (!strcmp(nm, ".") || !strcmp(nm, ".."))
             continue;
@@ -86,35 +192,53 @@ static void abs_path(const char *in, char *out, int n)
     snprintf(out, n, "%s%s", in[0] == '/' ? "" : "/", in);
 }
 
+/* Close a file handle, ignoring errors (but never leaving a command
+ * outstanding unless the driver is stuck). */
+static void mc_close(int fd)
+{
+    if (mc_begin() == 0)
+        mc_wait(mcClose(fd));
+}
+
 int mcio_read_file(int port, const char *path, u8 **data, int *len)
 {
     char p[160];
     abs_path(path, p, sizeof(p));
-    mcOpen(port, 0, p, IOX_RDONLY);
-    int fd = sync_ret();
+    *data = NULL;
+    *len = 0;
+    int e = mc_begin();
+    if (e)
+        return e;
+    int fd = mc_wait(mcOpen(port, 0, p, IOX_RDONLY));
     if (fd < 0)
         return fd;
-    mcSeek(fd, 0, SEEK_END);
-    int size = sync_ret();
-    mcSeek(fd, 0, SEEK_SET);
-    sync_ret();
-    if (size < 0) {
-        mcClose(fd);
-        sync_ret();
-        return size;
+    int size = mc_wait(mcSeek(fd, 0, SEEK_END));
+    if (size >= 0) {
+        int r = mc_wait(mcSeek(fd, 0, SEEK_SET));
+        if (r < 0)
+            size = r;
     }
-    u8 *b = malloc(size ? size : 1);
+    if (size < 0 || size > 32 * 1024 * 1024) {
+        mc_close(fd);
+        return size < 0 ? size : sceMcResFullDevice;
+    }
+    /* 64-byte aligned so the IOP can DMA straight into it */
+    u8 *b = memalign(64, size ? (size + 63) & ~63 : 64);
+    if (!b) {
+        mc_close(fd);
+        return sceMcResFullDevice;
+    }
     int got = 0, r = 0;
     while (got < size) {
         int want = size - got > CHUNK ? CHUNK : size - got;
-        mcRead(fd, b + got, want);
-        r = sync_ret();
+        r = mc_wait(mcRead(fd, b + got, want));
         if (r <= 0)
             break;
         got += r;
     }
-    mcClose(fd);
-    sync_ret();
+    if (r == MCIO_E_TIMEOUT)
+        return r; /* the IOP may still write into b later: leak it on purpose */
+    mc_close(fd);
     if (got != size) {
         free(b);
         return r < 0 ? r : sceMcResFailDetect;
@@ -128,24 +252,28 @@ int mcio_write_file(int port, const char *path, const u8 *data, int len)
 {
     char p[160];
     abs_path(path, p, sizeof(p));
+    int e = mc_begin();
+    if (e)
+        return e;
     /* replace: delete first so the old clusters are released */
-    mcDelete(port, 0, p);
-    sync_ret();
-    mcOpen(port, 0, p, IOX_WRONLY | IOX_CREAT);
-    int fd = sync_ret();
+    int r = mc_wait(mcDelete(port, 0, p));
+    if (r < 0 && r != sceMcResNoEntry)
+        return r;
+    int fd = mc_wait(mcOpen(port, 0, p, IOX_WRONLY | IOX_CREAT));
     if (fd < 0)
         return fd;
-    int put = 0, r = 0;
+    int put = 0;
+    r = 0;
     while (put < len) {
         int n = len - put > CHUNK ? CHUNK : len - put;
-        mcWrite(fd, data + put, n);
-        r = sync_ret();
+        r = mc_wait(mcWrite(fd, data + put, n));
         if (r <= 0)
             break;
         put += r;
     }
-    mcClose(fd);
-    sync_ret();
+    if (r == MCIO_E_TIMEOUT)
+        return r;
+    mc_close(fd);
     if (put != len)
         return r < 0 ? r : sceMcResFullDevice;
     return 0;
@@ -155,16 +283,32 @@ int mcio_mkdir(int port, const char *path)
 {
     char p[160];
     abs_path(path, p, sizeof(p));
-    mcMkDir(port, 0, p);
-    return sync_ret();
+    int e = mc_begin();
+    if (e)
+        return e;
+    return mc_wait(mcMkDir(port, 0, p));
 }
 
 int mcio_delete(int port, const char *path)
 {
     char p[160];
     abs_path(path, p, sizeof(p));
-    mcDelete(port, 0, p);
-    return sync_ret();
+    int e = mc_begin();
+    if (e)
+        return e;
+    return mc_wait(mcDelete(port, 0, p));
+}
+
+int mcio_set_info(int port, const char *path, const sceMcTblGetDir *info)
+{
+    static sceMcTblGetDir tmp __attribute__((aligned(64)));
+    char p[160];
+    abs_path(path, p, sizeof(p));
+    int e = mc_begin();
+    if (e)
+        return e;
+    tmp = *info;
+    return mc_wait(mcSetFileInfo(port, 0, p, &tmp, 0x01 | 0x02 | 0x04));
 }
 
 int mcio_delete_tree(int port, const char *dir)
@@ -192,8 +336,10 @@ int mcio_delete_tree(int port, const char *dir)
 
 int mcio_format(int port)
 {
-    mcFormat(port, 0);
-    return sync_ret();
+    int e = mc_begin();
+    if (e)
+        return e;
+    return mc_wait_ms(mcFormat(port, 0), MC_FORMAT_TIMEOUT_MS);
 }
 
 int mcio_list_saves(int port, save_info_t **out, int *count)
@@ -216,16 +362,27 @@ int mcio_list_saves(int port, save_info_t **out, int *count)
 
         sceMcTblGetDir *files;
         int nf;
-        if (mcio_list(port, si->name, &files, &nf) == 0) {
+        r = mcio_list(port, si->name, &files, &nf);
+        if (r == 0) {
             for (int j = 0; j < nf; j++)
                 si->size += files[j].FileSizeByte;
             free(files);
+        } else if (MCIO_IS_DRIVER_ERROR(r)) {
+            free(root);
+            free(s);
+            return r;
         }
         char ip[80];
         snprintf(ip, sizeof(ip), "%s/icon.sys", si->name);
         u8 *icon;
         int il;
-        if (mcio_read_file(port, ip, &icon, &il) == 0) {
+        r = mcio_read_file(port, ip, &icon, &il);
+        if (MCIO_IS_DRIVER_ERROR(r)) {
+            free(root);
+            free(s);
+            return r;
+        }
+        if (r == 0) {
             if (il >= 964 && !memcmp(icon, "PS2D", 4)) {
                 const u8 *t = icon + 0xC0;
                 int tl = 0;
@@ -346,57 +503,71 @@ int mcio_psu_to_card(int port, const u8 *psu, int len, int overwrite, char *dirn
 {
     char dir[33];
     if (psu_get_dirname(psu, len, dir) < 0)
-        return -1000; /* bad request */
+        return MCIO_E_BAD_PSU;
     if (dirname_out)
         strcpy(dirname_out, dir);
     u32 count = rd32(psu + 4);
     if (count < 2)
-        return -1000;
+        return MCIO_E_BAD_PSU;
     count -= 2;
 
     /* validate and measure */
     int off = 1536;
     int need_kb = (count + 2 + 1) / 2;
+    if (count > MCIO_MAX_ENTRIES)
+        return MCIO_E_BAD_PSU;
     for (u32 i = 0; i < count; i++) {
-        if (off + 512 > len)
-            return -1000;
-        u32 fl = rd32(psu + off + 4);
-        int padded = (fl + 1023) & ~1023;
-        if (off + 512 + (int)fl > len)
-            return -1000;
-        need_kb += padded / 1024;
-        off += 512 + padded;
-        if (off > len)
-            off = len; /* tolerate missing tail padding */
+        if ((long long)off + 512 > len)
+            return MCIO_E_BAD_PSU;
+        const u8 *ent = psu + off;
+        u16 mode = ent[0] | (ent[1] << 8);
+        u32 fl = rd32(ent + 4);
+        char name[33];
+        memcpy(name, ent + 0x40, 32);
+        name[32] = 0;
+        if ((mode & (DF_FILE | DF_EXISTS)) != (DF_FILE | DF_EXISTS) || !name[0] || strchr(name, '/') ||
+            !strcmp(name, ".") || !strcmp(name, ".."))
+            return MCIO_E_BAD_PSU;
+        if ((long long)off + 512 + fl > len)
+            return MCIO_E_BAD_PSU;
+        long long padded = ((long long)fl + 1023) & ~1023LL;
+        need_kb += (int)(padded / 1024);
+        long long next = off + 512 + padded;
+        off = next > len ? len : (int)next; /* tolerate missing tail padding */
     }
 
     mc_info_t mi;
-    mcio_info(port, &mi);
-    if (!mi.present)
+    int r = mcio_info(port, &mi);
+    if (r < 0)
+        return r;
+    if (!mi.present || !mi.formatted)
         return sceMcResNoFormat;
 
     char p[160];
     snprintf(p, sizeof(p), "/%s", dir);
     sceMcTblGetDir *tmp;
     int tn;
-    int exists = mcio_list(port, dir, &tmp, &tn) == 0;
+    r = mcio_list(port, dir, &tmp, &tn);
+    if (r < 0 && r != sceMcResNoEntry)
+        return r;
+    int exists = r == 0;
     if (exists) {
         int old_kb = (tn + 3) / 2;
         for (int i = 0; i < tn; i++)
             old_kb += (tmp[i].FileSizeByte + 1023) / 1024;
         free(tmp);
         if (!overwrite)
-            return -1001; /* exists */
+            return MCIO_E_EXISTS;
         if (mi.free_kb + old_kb < need_kb)
             return sceMcResFullDevice;
-        int r = mcio_delete_tree(port, p);
+        r = mcio_delete_tree(port, p);
         if (r < 0)
             return r;
     } else if (mi.free_kb < need_kb) {
         return sceMcResFullDevice;
     }
 
-    int r = mcio_mkdir(port, p);
+    r = mcio_mkdir(port, p);
     if (r < 0)
         return r;
 
@@ -413,14 +584,16 @@ int mcio_psu_to_card(int port, const u8 *psu, int len, int overwrite, char *dirn
         if (r < 0)
             return r;
         fill_info(&info, ent);
-        mcSetFileInfo(port, 0, p, &info, 0x01 | 0x02 | 0x04);
-        sync_ret();
+        r = mcio_set_info(port, p, &info);
+        if (MCIO_IS_DRIVER_ERROR(r))
+            return r;
         off += 512 + ((fl + 1023) & ~1023);
     }
     /* directory timestamps last, after the files touched it */
     snprintf(p, sizeof(p), "/%s", dir);
     fill_info(&info, psu);
-    mcSetFileInfo(port, 0, p, &info, 0x01 | 0x02 | 0x04);
-    sync_ret();
+    r = mcio_set_info(port, p, &info);
+    if (MCIO_IS_DRIVER_ERROR(r))
+        return r;
     return 0;
 }

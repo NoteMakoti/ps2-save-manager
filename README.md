@@ -178,6 +178,21 @@ make -C ps2/hosttest && mkdir -p /tmp/t/slot1 && CARD_ROOT=/tmp/t ps2/hosttest/p
 ps2sm ps2 127.0.0.1 put some.psu && ps2sm ps2 127.0.0.1 saves
 ```
 
+## Troubleshooting the network connection
+
+* **"the PS2 did not answer within … s"** — PS2SM must stay on the *Network
+  server* screen while the desktop app works with the cards. If it is on
+  that screen, the memory card driver on the console stopped responding;
+  restart PS2SM. (Since 0.2.0 every memory card command on the PS2 gives up
+  after 8 s, so the console no longer freezes; the desktop app shows
+  *"the memory card did not respond in time"* instead.)
+* **"refused the connection"** — the Network server isn't running (or a
+  different IP/port is set).
+* After any network error the desktop app drops the connection and opens a
+  fresh one on the next action, so just press ⟳ once the PS2 is ready.
+* **About / settings** on the PS2 lists modules that failed to load and
+  whether the memory card driver is responding.
+
 ## MemCard PRO2 notes
 
 * Enable the FTP server in the PRO2 WebUI (Settings), set a user/password,

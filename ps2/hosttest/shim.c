@@ -15,6 +15,23 @@
 #include "../src/storage.h"
 
 static int last;
+static int pending;        /* a command is queued (libmc m_current_command) */
+static int ncmds;          /* commands issued so far */
+static int stuck;          /* current command never completes */
+static int queue_cmd(void)
+{
+    if (pending)
+        return 1; /* libmc returns the busy command id */
+    pending = 1;
+    ncmds++;
+    const char *s = getenv("MC_STUCK_AFTER");
+    if (s && ncmds > atoi(s))
+        stuck = 1;
+    const char *d = getenv("MC_DELAY_MS");
+    if (d)
+        usleep(atoi(d) * 1000);
+    return 0;
+}
 static char root[2][256];
 static int present[2] = {1, 0};
 
@@ -23,24 +40,38 @@ static void host(int port, const char *p, char *out) {
     snprintf(out, 512, "%s%s", root[port], p);
 }
 int mcInit(int t) { (void)t; if (getenv("SLOT2")) present[1] = 1; return 0; }
-int mcSync(int m, int *c, int *r) { (void)m; (void)c; *r = last; return 1; }
-int mcGetInfo(int port, int s, int *type, int *fr, int *fmt) { (void)s; *type = present[port] ? 2 : 0; *fr = 7000; *fmt = 1; last = 0; return 0; }
-int mcOpen(int port, int s, const char *n, int mode) {
+int mcSync(int m, int *c, int *r)
+{
+    (void)c;
+    if (!pending)
+        return -1; /* nothing registered: real libmc leaves *r untouched */
+    if (stuck) {
+        if (m == MC_WAIT)
+            for (;;)
+                sleep(1); /* real libmc spins forever */
+        return 0;
+    }
+    pending = 0;
+    *r = last;
+    return 1;
+}
+int mcGetInfo(int port, int s, int *type, int *fr, int *fmt) { if (queue_cmd()) return 1;  (void)s; *type = present[port] ? 2 : 0; *fr = 7000; *fmt = 1; last = 0; return 0; }
+int mcOpen(int port, int s, const char *n, int mode) { if (queue_cmd()) return 1; 
     (void)s; char p[512]; host(port, n, p);
     int fl = (mode & 3) == 1 ? O_RDONLY : (mode & 3) == 2 ? O_WRONLY : O_RDWR;
     if (mode & 0x200) fl |= O_CREAT | O_TRUNC;
     int fd = open(p, fl, 0644); last = fd < 0 ? sceMcResNoEntry : fd; return 0; }
-int mcClose(int fd) { last = close(fd); return 0; }
-int mcSeek(int fd, int o, int w) { last = lseek(fd, o, w); return 0; }
-int mcRead(int fd, void *b, int n) { last = read(fd, b, n); return 0; }
-int mcWrite(int fd, const void *b, int n) { last = write(fd, b, n); return 0; }
-int mcMkDir(int port, int s, const char *n) { (void)s; char p[512]; host(port, n, p); last = mkdir(p, 0755) ? -4 : 0; return 0; }
-int mcDelete(int port, int s, const char *n) { (void)s; char p[512]; host(port, n, p);
+int mcClose(int fd) { if (queue_cmd()) return 1;  last = close(fd); return 0; }
+int mcSeek(int fd, int o, int w) { if (queue_cmd()) return 1;  last = lseek(fd, o, w); return 0; }
+int mcRead(int fd, void *b, int n) { if (queue_cmd()) return 1;  last = read(fd, b, n); return 0; }
+int mcWrite(int fd, const void *b, int n) { if (queue_cmd()) return 1;  last = write(fd, b, n); return 0; }
+int mcMkDir(int port, int s, const char *n) { if (queue_cmd()) return 1;  (void)s; char p[512]; host(port, n, p); last = mkdir(p, 0755) ? -4 : 0; return 0; }
+int mcDelete(int port, int s, const char *n) { if (queue_cmd()) return 1;  (void)s; char p[512]; host(port, n, p);
     struct stat st; if (stat(p, &st)) { last = sceMcResNoEntry; return 0; }
     last = S_ISDIR(st.st_mode) ? (rmdir(p) ? sceMcResNotEmpty : 0) : unlink(p); return 0; }
-int mcFormat(int port, int s) { (void)port; (void)s; last = 0; return 0; }
-int mcSetFileInfo(int port, int s, const char *n, const sceMcTblGetDir *i, unsigned f) { (void)port;(void)s;(void)n;(void)i;(void)f; last = 0; return 0; }
-int mcGetDir(int port, int s, const char *pat, unsigned m, int max, sceMcTblGetDir *t) {
+int mcFormat(int port, int s) { if (queue_cmd()) return 1;  (void)port; (void)s; last = 0; return 0; }
+int mcSetFileInfo(int port, int s, const char *n, const sceMcTblGetDir *i, unsigned f) { if (queue_cmd()) return 1;  (void)port;(void)s;(void)n;(void)i;(void)f; last = 0; return 0; }
+int mcGetDir(int port, int s, const char *pat, unsigned m, int max, sceMcTblGetDir *t) { if (queue_cmd()) return 1; 
     (void)s; (void)m; char dir[512], p[512]; const char *slash = strrchr(pat, '/');
     char d[256]; snprintf(d, sizeof d, "%.*s", (int)(slash - pat), pat); host(port, d[0] ? d : "", dir);
     DIR *D = opendir(dir); if (!D) { last = sceMcResNoEntry; return 0; }
@@ -65,11 +96,12 @@ int mmce_get(int port, int *c, int *ch, char *g, int gl) { (void)port; *c = 3; *
 int mmce_set(int port, int what, int mode, int num) { (void)port; (void)what; (void)mode; return num; }
 
 #include "../src/net.h"
+#include "../src/mcio.h"
 int main(int argc, char **argv) {
     g_have_net = 1; strcpy(g_ip_str, "127.0.0.1");
     config_defaults(&g_cfg);
     int port = argc > 1 ? atoi(argv[1]) : 6524;
-    mcInit(1);
+    if (mcio_init() < 0) { fprintf(stderr, "mcInit failed\n"); return 1; }
     if (net_server_start(port)) { perror("listen"); return 1; }
     fprintf(stderr, "host test server on %d\n", port);
     for (;;) { net_server_poll(100); }

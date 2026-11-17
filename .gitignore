@@ -5,3 +5,4 @@ ps2/src/*.o
 ps2/irx/
 ps2/hosttest/ps2sm-host
 /dist
+/target-*

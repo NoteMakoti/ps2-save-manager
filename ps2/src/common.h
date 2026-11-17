@@ -8,7 +8,7 @@
 #include <tamtypes.h>
 #include <stddef.h>
 
-#define PS2SM_VERSION "0.1.0"
+#define PS2SM_VERSION "0.2.0"
 #define PS2SM_DIR "PS2SM"
 
 /* iomanX / mcman open flags (SCE values, NOT newlib's O_*). */

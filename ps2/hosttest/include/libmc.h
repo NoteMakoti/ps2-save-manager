@@ -14,11 +14,15 @@ typedef struct {
 #define sceMcResNoEntry -4
 #define sceMcResDeniedPermit -5
 #define sceMcResNotEmpty -6
+#define sceMcResUpLimitHandle -7
 #define sceMcResFailDetect -12
+#define sceMcResFailDetect2 -13
 #define sceMcTypeNoCard 0
 #define sceMcTypePS1 1
 #define sceMcTypePS2 2
 #define MC_TYPE_XMC 1
+#define MC_WAIT 0
+#define MC_NOWAIT 1
 int mcInit(int); int mcSync(int, int*, int*);
 int mcGetInfo(int, int, int*, int*, int*);
 int mcOpen(int, int, const char*, int); int mcClose(int); int mcSeek(int, int, int);
